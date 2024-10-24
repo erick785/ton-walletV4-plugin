@@ -1,0 +1,161 @@
+#include "imports/stdlib.fc";
+
+;; check if two slices are equal
+(int) slice_data_equal?(slice s1, slice s2) asm "SDEQ";
+
+;; 销毁
+int op:destruct() asm "0x64737472 PUSHINT";
+;; 转账
+int op:payment_request() asm "0x706c7567 PUSHINT";
+;; 订阅
+int op:subscription() asm "0x73756273 PUSHINT";
+
+;; 外部销毁请求 crc32('external_destruct query_id:uint64 user:MsgAddress = InternalMsgBody')
+int op:external_destruct() asm "0x6a88ab15 PUSHINT";
+;; 外部支付请求 crc32('external_payment_request query_id:uint64 user:MsgAddress amount:Grams = InternalMsgBody')
+int op:external_payment_request() asm "0x667b4abb PUSHINT";
+
+;; 变更管理员 crc32('change_admin query_id:uint64 new_admin:MsgAddress = InternalMsgBody')
+int op:change_admin() asm "0xb985df84 PUSHINT";
+
+int max_reserved_funds() asm "67108864 PUSHINT"; ;; 0.0671 TON
+
+;; 将 gas 转换为相应的 coins
+int gas_to_coins(int workchain, int gas) inline_ref {
+    int config_index = 21 + workchain;
+    var cs = config_param(config_index).begin_parse();
+    if (cs.preload_uint(8) == 0xd1) {
+        ;; gas_flat_pfx
+        cs~skip_bits(8 + 64 + 64);
+    }
+    int tag = cs~load_uint(8);
+    throw_unless(71, (tag == 0xdd) | (tag == 0xde)); ;; gas_prices or gas_prices_ext
+    int gas_price = cs~load_uint(64);
+    return (gas * gas_price) >> 16;
+}
+
+;; 计算短消息转发费用
+int short_msg_fwd_fee(int workchain) inline {
+    int config_index = 25 + workchain;
+    int lump_price = config_param(config_index).begin_parse().skip_bits(8).preload_uint(64);
+    return lump_price;
+}
+
+(slice) load_storage() impure inline_ref {
+    var ds = get_data().begin_parse();
+    return (ds~load_msg_addr());
+}
+
+() save_storage(slice admin) impure inline_ref {
+    set_data(begin_cell()
+        .store_slice(admin)
+        .end_cell());
+}
+
+() forward_funds(slice beneficiary, int self_destruct?, int op) impure inline_ref {
+    if ~ (self_destruct?) {
+        raw_reserve(max_reserved_funds(), 2); ;; reserve at most `max_reserved_funds` nanocoins
+    }
+    var msg = begin_cell()
+        .store_uint(0x10, 6) ;; non-bounce message
+        .store_slice(beneficiary)
+        .store_grams(0)
+        .store_dict(pair_second(get_balance()))
+        .store_uint(0, 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(op, 32);
+    int mode = 128; ;; carry all the remaining balance of the current smart contract
+    if (self_destruct?) {
+        mode += 32; ;; must be destroyed if its resulting balance is zero
+    }
+    send_raw_message(msg.end_cell(), mode);
+}
+
+() request_payment(slice wallet, int requested_amount) impure inline_ref {
+    (int wc, _) = wallet.parse_std_addr();
+    int amount = gas_to_coins(wc, 15000) + short_msg_fwd_fee(wc);
+
+    var msg = begin_cell().store_uint(0x18, 6)
+        .store_slice(wallet)
+        .store_grams(amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(op:payment_request(), 32) ;; request op
+        .store_uint(cur_lt(), 64) ;; query_id 用时间戳
+        .store_grams(requested_amount)
+        .store_uint(0, 1); ;; empty extra
+    send_raw_message(msg.end_cell(), 3);
+}
+
+() self_destruct(slice wallet, slice beneficiary) impure {
+    ;; send event to wallet
+    (int wc, _) = wallet.parse_std_addr();
+    int amount = gas_to_coins(wc, 10000);
+
+    var msg = begin_cell().store_uint(0x10, 6) ;; non-bounce - we dont need answer from wallet
+        .store_slice(wallet)
+        .store_grams(amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(op:destruct(), 32) ;; request op
+        .store_uint(cur_lt(), 64); ;; query_id
+    send_raw_message(msg.end_cell(), 3);
+
+    ;; forward all the remaining funds to the beneficiary & destroy
+
+    forward_funds(beneficiary, true, op:destruct());
+}
+
+() change_admin(slice new_admin) impure {
+    save_storage(new_admin);
+}
+
+() recv_internal(int msg_value, cell in_msg_cell, slice in_msg) impure {
+    var  admin = load_storage();
+    var cs = in_msg_cell.begin_parse();
+    var flags = cs~load_uint(4); ;; skip flags
+    if (flags & 1) {
+        ;; ignore all bounced messages
+        return ();
+    }
+
+    slice s_addr = cs~load_msg_addr(); ;; src address
+
+    if (in_msg.slice_bits() < 32) {
+        ;; ignore simple transfers
+        return ();
+    }
+
+    int op = in_msg~load_uint(32); ;;  by convention, the first 32 bits of incoming message is the operation code
+    if (op == op:change_admin()) {
+        throw_unless(100, slice_data_equal?(s_addr, admin)); ;; only admin can change admin
+        var new_admin = in_msg~load_msg_addr();
+        change_admin(new_admin);
+    }
+
+    if (op == op:external_payment_request()) {
+        throw_unless(100, slice_data_equal?(s_addr, admin)); ;; only admin can request funds
+        var user = in_msg~load_msg_addr();
+        var amount = in_msg~load_grams();
+        request_payment(user, amount);
+    }
+
+    if (op == op:external_destruct()) {
+        throw_unless(100, slice_data_equal?(s_addr, admin)); ;; only admin can request self-destruct
+        var user = in_msg~load_msg_addr();
+        self_destruct(user, admin);
+    }
+
+    if (op == (op:payment_request() | 0x80000000)) {
+        (int from_wc, _) = s_addr.parse_std_addr();
+        forward_funds(admin, false, op:subscription());
+    }
+
+    if (op == (op:destruct()| 0x80000000)) {
+        ;; forward all the remaining funds to the beneficiary & destroy
+        return forward_funds(admin, true, op:destruct());
+    }
+    
+}
+
+slice get_admin() method_id {
+    return load_storage();
+}
+
